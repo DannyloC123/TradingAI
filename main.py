@@ -10,8 +10,8 @@ load_dotenv("tokens.env")
 async def main():
     client = ExchangeClient(
         team_token=os.getenv("TEAM_TOKEN"),
-        gateway=GatewayConfig(host="MARKET_HOST"),
-        market_data=MarketDataConfig(host="MARKET_HOST")
+        gateway=GatewayConfig(host=os.getenv("MARKET_HOST")),
+        market_data=MarketDataConfig(host=os.getenv("MARKET_HOST"))
     )
 
     await client.connect()
