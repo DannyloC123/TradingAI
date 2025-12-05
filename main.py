@@ -5,34 +5,14 @@ from exchange_sdk import ExchangeClient
 from exchange_sdk.client import GatewayConfig, MarketDataConfig
 import httpx
 import asyncio
+from random import random
+import time
 
 # Load token from tokens.env
 load_dotenv("tokens.env")
 
 EXCHANGE_HOST = "159.65.173.202"
 
-
-# ---------------- SYMBOL CLASSES -----------------
-
-class XYZ:
-    type = 'Stock'
-    tickSize = 0.01
-    symbolID = 1
-
-class ETF:
-    type = 'Fund'
-    tickSize = 0.01
-    symbolID = 2
-
-class ABC:
-    type = 'Stock'
-    tickSize = 0.01
-    symbolID = 3
-
-class DEF:
-    type = 'Stock'
-    tickSize = 0.01
-    symbolID = 4
 
 # -------------- TRADING FUNCTIONS -----------------
 
@@ -58,6 +38,31 @@ async def sell(client, symbol, price_dollars, quantity, client_id):
         quantity=quantity
     )
 
+async def get_bid_ask(symbol):
+    async with httpx.AsyncClient() as client:
+        response = await client.get(f"http://{EXCHANGE_HOST}:8081/quotes")
+        quotes = response.json()
+
+        # Check if symbol exists and has quotes
+        if symbol not in quotes:
+            return None, None
+
+        bid = quotes[symbol]["bid"]
+        ask = quotes[symbol]["ask"]
+
+        return bid, ask
+    
+async def get_workbook(symbol):
+    async with httpx.AsyncClient() as client:
+        # Get 10-level orderbook depth
+        response = await client.get(f"http://{EXCHANGE_HOST}:8081/orderbook/ETF")
+        orderbook = response.json()
+        
+        print(f"\nETF Orderbook:")
+        print(f"Best bid: ${orderbook['bids'][0]['price']:.2f} x {orderbook['bids'][0]['quantity']}")
+        print(f"Best ask: ${orderbook['asks'][0]['price']:.2f} x {orderbook['asks'][0]['quantity']}")
+
+# returns current price, order book depth, and recent trades for another symbol
 async def get_market_data():
     async with httpx.AsyncClient() as client:
         # Get current quotes (best bid/ask for all symbols)
@@ -85,11 +90,70 @@ async def get_market_data():
         for trade in data['trades']:
             print(f"{trade['side']} {trade['quantity']} @ ${trade['price']:.2f}")
 
-asyncio.run(get_market_data())
+#asyncio.run(get_market_data())
+
+
+# ---------------- SYMBOL CLASSES -----------------
+run_time = 5         # 7200 seconds = 2 hours
+
+
+class XYZ:
+    type = 'Stock'
+    tickSize = 0.01
+    symbolID = 1
+
+    async def run(self):
+        for x in range(run_time):
+            bid, ask = await get_bid_ask("XYZ")
+            print(f"XYZ Bid: {bid}, Ask: {ask}")
+            await asyncio.sleep(1)
+
+
+class ETF:
+    type = 'Fund'
+    tickSize = 0.01
+    symbolID = 2
+
+    async def run(self):
+        for x in range(run_time):
+            bid, ask = await get_bid_ask("ETF")
+            print(f"ETF Bid: {bid}, Ask: {ask}")
+            await asyncio.sleep(1)
+
+
+class ABC:
+    type = 'Stock'
+    tickSize = 0.01
+    symbolID = 3
+
+    async def run(self):
+        for x in range(run_time):
+            bid, ask = await get_bid_ask("ABC")
+            print(f"ABC Bid: {bid}, Ask: {ask}")
+            await asyncio.sleep(1)
+
+
+class DEF:
+    type = 'Stock'
+    tickSize = 0.01
+    symbolID = 4
+
+    async def run(self):
+        for x in range(run_time):
+            bid, ask = await get_bid_ask("DEF")
+            print(f"DEF Bid: {bid}, Ask: {ask}")
+            await asyncio.sleep(1)
+
+
+
 
 # -------------- MAIN PROGRAM ----------------------
 
 async def main():
+    # test variables
+    #num_stock = random.randint(1,100)
+    #time_interval = random.randint(1, 36000)
+
     client = ExchangeClient(
         team_token=os.getenv("TEAM_TOKEN"),
         gateway=GatewayConfig(host=os.getenv("MARKET_HOST")),
@@ -99,12 +163,18 @@ async def main():
     await client.connect()
     print("Connected successfully!")
 
-    # Example trades:
-    order1 = await buy(client, XYZ, price_dollars=100.00, quantity=10, client_id=1)
-    print("BUY order sent:", order1)
 
-    order2 = await sell(client, ABC, price_dollars=50.25, quantity=5, client_id=2)
-    print("SELL order sent:", order2)
+
+    await DEF().run()
+
+    await ABC().run()
+
+    # Example trades:
+    #order1 = await buy(client, XYZ, price_dollars=0, quantity=200, client_id=1)
+    #print("BUY order sent:", order1)
+
+    #order2 = await sell(client, ABC, price_dollars=50.25, quantity=5, client_id=2)
+    #print("SELL order sent:", order2)
 
     await client.close()
 
