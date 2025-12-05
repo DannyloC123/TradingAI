@@ -3,9 +3,14 @@ import os
 from dotenv import load_dotenv
 from exchange_sdk import ExchangeClient
 from exchange_sdk.client import GatewayConfig, MarketDataConfig
+import httpx
+import asyncio
 
 # Load token from tokens.env
 load_dotenv("tokens.env")
+
+EXCHANGE_HOST = "159.65.173.202"
+
 
 # ---------------- SYMBOL CLASSES -----------------
 
@@ -52,6 +57,35 @@ async def sell(client, symbol, price_dollars, quantity, client_id):
         price_ticks=price_ticks,
         quantity=quantity
     )
+
+async def get_market_data():
+    async with httpx.AsyncClient() as client:
+        # Get current quotes (best bid/ask for all symbols)
+        response = await client.get(f"http://{EXCHANGE_HOST}:8081/quotes")
+        quotes = response.json()
+        
+        for symbol, data in quotes.items():
+            if data['bid'] and data['ask']:
+                print(f"{symbol}: ${data['bid']:.2f} / ${data['ask']:.2f}")
+                print(f"  Spread: ${data['ask'] - data['bid']:.2f}")
+        
+        # Get 10-level orderbook depth
+        response = await client.get(f"http://{EXCHANGE_HOST}:8081/orderbook/ETF")
+        orderbook = response.json()
+        
+        print(f"\nETF Orderbook:")
+        print(f"Best bid: ${orderbook['bids'][0]['price']:.2f} x {orderbook['bids'][0]['quantity']}")
+        print(f"Best ask: ${orderbook['asks'][0]['price']:.2f} x {orderbook['asks'][0]['quantity']}")
+        
+        # Get recent trades for specific symbol
+        response = await client.get(
+            f"http://{EXCHANGE_HOST}:8081/trades/recent?symbol=XYZ&limit=10"
+        )
+        data = response.json()
+        for trade in data['trades']:
+            print(f"{trade['side']} {trade['quantity']} @ ${trade['price']:.2f}")
+
+asyncio.run(get_market_data())
 
 # -------------- MAIN PROGRAM ----------------------
 
