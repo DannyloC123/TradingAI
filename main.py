@@ -21,40 +21,53 @@ EXCHANGE_HOST = "159.65.173.202"
 # -------------- TRADING FUNCTIONS -----------------
 
 async def buy(client, symbol, price_dollars, quantity, client_id):
-    """Place a BUY order."""
-    price_ticks = int(price_dollars * 100)  # convert dollars → cents
-    return await client.send_new_async(
-        client_id=client_id,
-        symbol_id=symbol.symbolID,
-        side=0,                 # BUY
-        price_ticks=price_ticks,
-        quantity=quantity
-    )
+    try:
+        price_ticks = int(price_dollars * 100)
+        order_id = await client.send_new_async(
+            client_id=client_id,
+            symbol_id=symbol.symbolID,
+            side=0,
+            price_ticks=price_ticks,
+            quantity=quantity
+        )
+        print(f"[BUY] {symbol.ticker} @ ${price_dollars:.2f} x{quantity} | order_id={order_id}")
+        return order_id
+    except Exception as e:
+        print(f"[BUY ERROR] {e}")
+
 
 async def sell(client, symbol, price_dollars, quantity, client_id):
-    """Place a SELL order."""
-    price_ticks = int(price_dollars * 100)
-    return await client.send_new_async(
-        client_id=client_id,
-        symbol_id=symbol.symbolID,
-        side=1,                 # SELL
-        price_ticks=price_ticks,
-        quantity=quantity
-    )
+    try:
+        price_ticks = int(price_dollars * 100)
+        order_id = await client.send_new_async(
+            client_id=client_id,
+            symbol_id=symbol.symbolID,
+            side=1,
+            price_ticks=price_ticks,
+            quantity=quantity
+        )
+        print(f"[SELL] {symbol.ticker} @ ${price_dollars:.2f} x{quantity} | order_id={order_id}")
+        return order_id
+    except Exception as e:
+        print(f"[SELL ERROR] {e}")
+
 
 async def get_bid_ask(symbol):
-    async with httpx.AsyncClient() as client:
-        response = await client.get(f"http://{EXCHANGE_HOST}:8081/quotes")
-        quotes = response.json()
+    async with httpx.AsyncClient(timeout=1.0) as client:  
+        for _ in range(5):      # retry up to 5 times
+            try:
+                r = await client.get(f"http://{EXCHANGE_HOST}:8081/quotes")
+                data = r.json()
+                bid = data[symbol]["bid"]
+                ask = data[symbol]["ask"]
+                return bid, ask
+            except Exception as e:
+                print(f"[WARN] quote fetch failed for {symbol}, retrying... {e}")
+                await asyncio.sleep(0.1)
 
-        # Check if symbol exists and has quotes
-        if symbol not in quotes:
-            return None, None
+    print(f"[ERROR] get_bid_ask() failed permanently for {symbol}")
+    return None, None
 
-        bid = quotes[symbol]["bid"]
-        ask = quotes[symbol]["ask"]
-
-        return bid, ask
     
 async def get_workbook(symbol):
     async with httpx.AsyncClient() as client:
@@ -218,79 +231,88 @@ class MeanReversionBot:
         self.max_pos_dollars = 100000
         self.small_pos_pct = 0.30   # 30%
 
-        # state tracking: prevents spamming orders
-            # levels: 0 = Neutral, 1 = Small Trade Done, 2 = Full Trade Done
+        # state tracking
         self.current_tier = 0
-        self.side = None # 'LONG' or 'SHORT'
+        self.side = None 
     
     async def run(self):
         client_req_id = 1000
-        print(f"--- Starting Mean Reversion Bot for {self.symbol.ticker} ---")
+        print(f"--- Starting Mean Reversion Bot for {self.symbol.ticker} ---", flush=True)
 
         while True:
             # market data
             bid, ask = await get_bid_ask(self.symbol.ticker)
+            
+            # If the exchange returns no data (rare, but possible)
             if bid is None or ask is None:
-                print("Waiting for data...")
+                print("Waiting for quotes...", flush=True)
                 await asyncio.sleep(1)
                 continue
             
             # calculate mid-price
             current_price = (bid + ask) / 2
 
-            # update history + calculate mean
+            # update history
             self.price_history.append(current_price)
+
+            # --- THE FIX IS HERE ---
+            # If we don't have 20 prices yet, print progress so we know it's working
             if len(self.price_history) < self.history_len:
-                print(f"[Init] Collecting data... {len(self.price_history)}/{self.history_len} | Curr: ${current_price:.2f}")
+                print(f"[Warmup] Collecting data... {len(self.price_history)}/{self.history_len} | Price: ${current_price:.2f}", flush=True)
                 await asyncio.sleep(1)
                 continue
+            
+            # -----------------------
+
             avg_price = np.mean(self.price_history)
             deviation = current_price - avg_price
 
-            print(f"Price: ${current_price:.2f} | Mean: ${avg_price:.2f} | Dev: ${deviation:+.2f} | Tier: {self.current_tier} ({self.side})")
+            # Print status every second so you know it's alive
+            print(f"Price: ${current_price:.2f} | Mean: ${avg_price:.2f} | Dev: ${deviation:+.2f}", flush=True)
 
             # check thresholds
-            # UPPER BAND: Price is too high -> SELL/SHORT
-            if deviation >= 4.70:
+            # === MEAN REVERSION TRADING LOGIC ===
+
+            # FULL SHORT (overpriced)
+            if deviation >= 0.80:
                 if self.current_tier != 2 or self.side != 'SHORT':
-                    print(f"\n!!! THRESHOLD ALERT: +$4.70 Deviation. Executing FULL SHORT.")
+                    print(f">>> FULL SHORT at bid {bid}")
                     qty = int(self.max_pos_dollars / current_price)
-                    await sell(self.client, self.symbol, current_price, qty, client_req_id)
+                    await sell(self.client, self.symbol, bid, qty, client_req_id)
                     self.current_tier = 2
                     self.side = 'SHORT'
                     client_req_id += 1
-            elif deviation >= 3.00:
+
+            # SMALL SHORT
+            elif deviation >= 0.30:
                 if self.current_tier == 0:
-                    print(f"\n>>> THRESHOLD ALERT: +$3.00 Deviation. Executing SMALL SHORT.")
+                    print(f"> SMALL SHORT at bid {bid}")
                     qty = int((self.max_pos_dollars * self.small_pos_pct) / current_price)
-                    await sell(self.client, self.symbol, current_price, qty, client_req_id)
+                    await sell(self.client, self.symbol, bid, qty, client_req_id)
                     self.current_tier = 1
                     self.side = 'SHORT'
                     client_req_id += 1
-            # LOWER BAND: Price is too low -> BUY/LONG
-            elif deviation <= -4.70:
+
+            # FULL LONG (undervalued)
+            elif deviation <= -0.80:
                 if self.current_tier != 2 or self.side != 'LONG':
-                    print(f"\n!!! THRESHOLD ALERT: -$4.70 Deviation. Executing FULL LONG.")
+                    print(f">>> FULL LONG at ask {ask}")
                     qty = int(self.max_pos_dollars / current_price)
-                    await buy(self.client, self.symbol, current_price, qty, client_req_id)
+                    await buy(self.client, self.symbol, ask, qty, client_req_id)
                     self.current_tier = 2
                     self.side = 'LONG'
                     client_req_id += 1
-            elif deviation <= -3.00:
+
+            # SMALL LONG
+            elif deviation <= -0.30:
                 if self.current_tier == 0:
-                    print(f"\n>>> THRESHOLD ALERT: -$3.00 Deviation. Executing SMALL LONG.")
+                    print(f"> SMALL LONG at ask {ask}")
                     qty = int((self.max_pos_dollars * self.small_pos_pct) / current_price)
-                    await buy(self.client, self.symbol, current_price, qty, client_req_id)
+                    await buy(self.client, self.symbol, ask, qty, client_req_id)
                     self.current_tier = 1
                     self.side = 'LONG'
                     client_req_id += 1
-            
-            
-            # Optional: Reset logic debug
-            elif abs(deviation) < 0.50 and self.current_tier != 0:
-                 print(f"--- Price returned to mean. Resetting Tier to 0. ---")
-                 self.current_tier = 0
-                 self.side = None
+
 
             await asyncio.sleep(1)
 
@@ -313,27 +335,19 @@ async def main():
     await client.connect()
     print("Connected successfully!")
 
-    # run MeanReversionBot strategy
-    bot = MeanReversionBot(client, XYZ())
-    await bot.run()
+    # Create all bots
+    bot_xyz = MeanReversionBot(client, XYZ())
+    bot_etf = MeanReversionBot(client, ETF())
+    bot_abc = MeanReversionBot(client, ABC())
+    bot_def = MeanReversionBot(client, DEF())
 
-    # gets the average
-    '''
-    for x in range(run_time):
-        recent_avg, moving_avg = await get_average_price("DEF")
-        print(f'Recent Average: {recent_avg} \nMoving Average: {moving_avg}')
-        time.sleep(1)
-    '''
-
-
-    
-    #await get_recent_trades("DEF")
-
-    #await get_workbook("DEF")
-
-    #await DEF().run()
-
-
+    # Run all at the same time
+    await asyncio.gather(
+        bot_xyz.run(),
+        bot_etf.run(),
+        bot_abc.run(),
+        bot_def.run()
+    )
     # Example trades:
     #order1 = await buy(client, XYZ, price_dollars=0, quantity=200, client_id=1)
     #print("BUY order sent:", order1)
@@ -344,3 +358,73 @@ async def main():
     await client.close()
 
 asyncio.run(main())
+
+
+async def main():
+    # Connect using real team token
+    client = ExchangeClient(
+        team_token=os.getenv("TEAM_TOKEN"),
+        gateway=GatewayConfig(host=EXCHANGE_HOST),
+        market_data=MarketDataConfig(host=EXCHANGE_HOST)
+    )
+
+    await client.connect()
+    print("Connected to exchange!")
+
+    # BUY 5 shares of XYZ at the current ASK
+    resp = await client.send_new_async(
+        client_id=1,
+        symbol_id=1,         # XYZ
+        side=0,              # 0 = BUY
+        price_ticks=10000,   # $100.00 (SAFE price inside collar)
+        quantity=5
+    )
+
+    print("Order submitted! order_id =", resp)
+
+    await client.close()
+
+if __name__ == "__main__":
+    asyncio.run(main())
+
+
+
+
+'''
+import asyncio
+from exchange_sdk import ExchangeClient
+from exchange_sdk.client import GatewayConfig, MarketDataConfig
+
+TEAM_TOKEN = "stripedorangecatglobal-aiwn872djc"          # ← IMPORTANT
+EXCHANGE_HOST = "159.65.173.202"             # ← correct host
+
+async def main():
+    # Create client
+    client = ExchangeClient(
+        team_token=TEAM_TOKEN,
+        gateway=GatewayConfig(host=EXCHANGE_HOST),
+        market_data=MarketDataConfig(host=EXCHANGE_HOST)
+    )
+
+    print("Connecting...")
+    await client.connect()
+    print("Connected!")
+
+    # ---- TEST BUY ORDER ----
+    print("\nSubmitting BUY order for 10 shares of XYZ at $100.00...")
+    order_id = await client.send_new_async(
+        client_id=1,          # Your tracking ID
+        symbol_id=1,          # 1 = XYZ
+        side=0,               # 0 = BUY
+        price_ticks=10000,    # $100.00
+        quantity=10
+    )
+
+    print("Order submitted! Exchange order_id:", order_id)
+
+    await client.close()
+    print("Closed connection.")
+
+if __name__ == "__main__":
+    asyncio.run(main())
+'''
