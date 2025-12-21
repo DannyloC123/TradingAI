@@ -8,6 +8,10 @@ The objective was to **maximize net profit (P&L)** while managing volatility, tr
 
 **Final Placement:** 7th out of 14 teams.
 
+
+<img width="429" height="496" alt="Screenshot 2025-12-21 123913" src="https://github.com/user-attachments/assets/8c64ed02-f459-48b3-9b27-3f03dc3591ec" />
+
+
 ---
 
 ## Team
