@@ -1,296 +1,228 @@
 import asyncio
 import os
+import httpx
+import numpy as np
 from dotenv import load_dotenv
 from exchange_sdk import ExchangeClient
 from exchange_sdk.client import GatewayConfig, MarketDataConfig
-import httpx
-import asyncio
-import numpy as np
-import collections
 
-# Load token from tokens.env
 load_dotenv("tokens.env")
 
-# --- GLOBAL SETTINGS (Absolute Max Profit Configuration) ---
-EXCHANGE_HOST = os.getenv("MARKET_HOST") # Use env var for robustness
-MAX_TRADE_NOTIONAL = 1000000             # $1M Notional
-MIN_PROFIT_THRESHOLD = 0.03              # Aggressively low for MAX frequency
-AGGRESSIVE_MARKET_PRICE = 0.05           # Ensures instant fill
+EXCHANGE_HOST = os.getenv("MARKET_HOST")
+TEAM_TOKEN = os.getenv("TEAM_TOKEN")
 
-# ---------------- TRADING FUNCTIONS (REMOVED) -----------------
-# The global 'buy' and 'sell' functions, and the SymbolWrapper class are removed 
-# to eliminate latency. Order submission is now handled directly inside OptimisedArbBot.
+# ---------------------------------------------------------
+# CONFIGURATION
+# ---------------------------------------------------------
+TARGET_EXPOSURE = 400_000       # ALWAYS maintain at least this much
+AGGRESSIVE = 0.05               # price offset to guarantee fill
+MEAN_WINDOW = 20
+MIN_SPREAD = 0.03
+MAX_TRADE_NOTIONAL = 100_000    # per arbitrage cycle
+LOOP_DELAY = 0                  # fastest possible loop
 
-# --- Global Data Fetching (Kept for MeanReversionBot and Market Analysis) ---
-# Note: get_all_prices is used by the OptimisedArbBot for max speed.
+# Symbol IDs
+SYMBOLS = {
+    "XYZ": 1,
+    "ETF": 2,
+    "ABC": 3,
+    "DEF": 4
+}
 
-async def get_bid_ask(symbol):
-    """Fetches bid/ask for a single symbol with retries."""
-    async with httpx.AsyncClient(timeout=1.0) as client: 
-        for _ in range(5): 
-            try:
-                r = await client.get(f"http://{EXCHANGE_HOST}:8081/quotes")
-                data = r.json()
-                bid = data[symbol]["bid"]
-                ask = data[symbol]["ask"]
-                return bid, ask
-            except Exception:
-                await asyncio.sleep(0.01)
-    return None, None
+WEIGHTS = {"XYZ": 0.5, "ABC": 0.3, "DEF": 0.2}
 
-# ---------------- SYMBOL CLASSES (Simplified) -----------------
+# ---------------------------------------------------------
+# SHARED PRICE FETCHER
+# ---------------------------------------------------------
+async def get_quotes(client):
+    try:
+        r = await client.get(f"http://{EXCHANGE_HOST}:8081/quotes")
+        return r.json()
+    except:
+        return None
 
-class SymbolData:
-    """Simple container for symbol data used by the bots."""
-    def __init__(self, ticker, symbolID):
-        self.ticker = ticker
-        self.symbolID = symbolID
-
-ETF = SymbolData("ETF", 2)
-XYZ = SymbolData("XYZ", 1)
-ABC = SymbolData("ABC", 3)
-DEF = SymbolData("DEF", 4)
-
-
-# ---------------- STRATEGY IMPLEMENTATION -----------------
-
-## 🐢 Mean Reversion Bot (Trading Component Stocks: ABC, DEF, XYZ)
-class MeanReversionBot:
-    """Trades a single component stock based on mean reversion logic."""
-    def __init__(self, client, symbol_obj):
-        self.client = client
-        self.symbol = symbol_obj
-
-        self.history_len = 20
-        self.price_history = collections.deque(maxlen=self.history_len)
-        self.max_pos_dollars = 100000
-        self.small_pos_pct = 0.30
-        self.current_tier = 0
-        self.side = None
-        self.client_req_id = 1000 # Separate ID block for MR Bot
-
-    async def _send_order(self, side, price, qty):
-        """MR Bot's direct order submission (no aggressive offset needed for MR)."""
-        if qty <= 0: return
-        self.client_req_id += 1
-        price_ticks = int(price * 100) # Use market price without aggressive offset
-        
-        try:
-            await self.client.send_new_async(
-                client_id=self.client_req_id,
-                symbol_id=self.symbol.symbolID,
-                side=side,
-                price_ticks=price_ticks,
-                quantity=qty
-            )
-            print(f"[MR {self.symbol.ticker}] {'BUY' if side == 0 else 'SELL'} @ ${price:.2f} x{qty}")
-        except Exception:
-            pass
-
-    async def run(self):
-        print(f"--- Starting Mean Reversion Bot for {self.symbol.ticker} ---")
-        while True:
-            bid, ask = await get_bid_ask(self.symbol.ticker)
-            
-            if bid is None or ask is None:
-                await asyncio.sleep(1); continue
-            
-            current_price = (bid + ask) / 2
-            self.price_history.append(current_price)
-            
-            if len(self.price_history) < self.history_len:
-                await asyncio.sleep(1); continue
-            
-            avg_price = np.mean(self.price_history)
-            deviation = current_price - avg_price
-
-            # --- Mean Reversion Logic (remains the same) ---
-            if deviation >= 0.80:
-                if self.current_tier != 2 or self.side != 'SHORT':
-                    qty = int(self.max_pos_dollars / current_price)
-                    await self._send_order(1, bid, qty)
-                    self.current_tier = 2; self.side = 'SHORT'
-            elif deviation >= 0.30:
-                if self.current_tier == 0:
-                    qty = int((self.max_pos_dollars * self.small_pos_pct) / current_price)
-                    await self._send_order(1, bid, qty)
-                    self.current_tier = 1; self.side = 'SHORT'
-            elif deviation <= -0.80:
-                if self.current_tier != 2 or self.side != 'LONG':
-                    qty = int(self.max_pos_dollars / current_price)
-                    await self._send_order(0, ask, qty)
-                    self.current_tier = 2; self.side = 'LONG'
-            elif deviation <= -0.30:
-                if self.current_tier == 0:
-                    qty = int((self.max_pos_dollars * self.small_pos_pct) / current_price)
-                    await self._send_order(0, ask, qty)
-                    self.current_tier = 1; self.side = 'LONG'
-
-            await asyncio.sleep(1) # MR can afford to wait 1 second
-
-## 🚀 Optimised Arbitrage Bot (Trading ETF & Basket)
-class OptimisedArbBot:
-    """Executes the 4-legged ETF Arbitrage at max speed and volume."""
+# ---------------------------------------------------------
+# GLOBAL EXPOSURE MANAGER
+# ---------------------------------------------------------
+class ExposureManager:
     def __init__(self, client):
         self.client = client
-        self.http_client = httpx.AsyncClient() 
-        self.req_id = 1000000 # High client ID block for HFT
-        
-        self.weights = {'XYZ': 0.5, 'ABC': 0.3, 'DEF': 0.2}
-        self.sym_ids = {'XYZ': 1, 'ETF': 2, 'ABC': 3, 'DEF': 4}
+        self.exposure = 0
+        self.req_id = 10_000_000
 
-    async def get_all_prices(self):
-        """Fetches all quotes in a single request for speed."""
-        try:
-            r = await self.http_client.get(f"http://{EXCHANGE_HOST}:8081/quotes")
-            return r.json()
-        except Exception:
+    async def update_exposure(self, quotes):
+        """Estimate portfolio exposure using mid-prices."""
+        mids = {
+            s: (quotes[s]["bid"] + quotes[s]["ask"]) / 2
+            for s in SYMBOLS.keys()
+        }
+        # No position tracking API → assume exposure approx. = total traded value
+        # We'll update exposure when placing trades
+        return mids
+
+    async def force_exposure(self, mids):
+        """If exposure < TARGET_EXPOSURE, open ETF until target reached."""
+        deficit = TARGET_EXPOSURE - self.exposure
+        if deficit <= 0:
+            return
+
+        qty = int(deficit / mids["ETF"])
+        if qty <= 0:
+            return
+
+        print(f"\n[FORCE EXPOSURE] Buying {qty} ETF to restore exposure.")
+
+        self.req_id += 1
+        price_ticks = int((mids["ETF"] + AGGRESSIVE) * 100)
+
+        await self.client.send_new_async(
+            client_id=self.req_id,
+            symbol_id=SYMBOLS["ETF"],
+            side=0,
+            price_ticks=price_ticks,
+            quantity=qty
+        )
+
+        self.exposure += qty * mids["ETF"]
+
+    async def register_trade(self, value):
+        """Increase exposure whenever a trade is executed."""
+        self.exposure += abs(value)
+
+# ---------------------------------------------------------
+# MEAN REVERSION ENGINE
+# ---------------------------------------------------------
+class MeanReversion:
+    def __init__(self):
+        self.history = {s: [] for s in ["XYZ", "ABC", "DEF"]}
+
+    def update(self, symbol, price):
+        hist = self.history[symbol]
+        hist.append(price)
+        if len(hist) > MEAN_WINDOW:
+            hist.pop(0)
+
+        if len(hist) < MEAN_WINDOW:
             return None
 
-    async def _send_order_raw(self, ticker, side, price, qty):
-        """Sends a zero-latency, aggressive order directly to the client."""
-        if qty <= 0: return
+        avg = sum(hist) / len(hist)
+        dev = price - avg
+        return dev
+
+# ---------------------------------------------------------
+# ARBITRAGE ENGINE
+# ---------------------------------------------------------
+class Arbitrage:
+    def __init__(self, client, exposure_mgr):
+        self.client = client
+        self.exposure_mgr = exposure_mgr
+        self.req_id = 300_000
+
+    async def send(self, ticker, side, price, qty):
+        if qty <= 0:
+            return
+
+        price_adj = price + AGGRESSIVE if side == 0 else price - AGGRESSIVE
+        ticks = int(price_adj * 100)
         self.req_id += 1
-        
-        # Aggression Logic (CRITICAL for instant fill)
-        price_aggressed = price + AGGRESSIVE_MARKET_PRICE if side == 0 else price - AGGRESSIVE_MARKET_PRICE
-        price_ticks = int(price_aggressed * 100)
-        
-        try:
-            await self.client.send_new_async(
-                client_id=self.req_id,
-                symbol_id=self.sym_ids[ticker],
-                side=side,
-                price_ticks=price_ticks,
-                quantity=qty
-            )
-            # Minimal log for debugging, but must be fast
-            # print(f"[{'BUY' if side == 0 else 'SELL'}] {ticker} @ ${price_aggressed:.2f} x{qty}")
-        except Exception:
-            pass
 
-    async def execute_basket(self, side, qty_etf, prices):
-        """Executes all 4 legs SIMULTANEOUSLY using the raw sender."""
-        tasks = []
-        
-        qty_xyz = int(qty_etf * self.weights['XYZ'])
-        qty_abc = int(qty_etf * self.weights['ABC'])
-        qty_def = int(qty_etf * self.weights['DEF'])
-        
-        if side == 'SELL_ETF':
-            # Sell ETF (Bid) + Buy Components (Ask)
-            # print(f">>> ARB EXECUTION: Sell {qty_etf} ETF | Buy Components")
-            tasks.append(self._send_order_raw("ETF", 1, prices['ETF']['bid'], qty_etf))
-            tasks.append(self._send_order_raw("XYZ", 0, prices['XYZ']['ask'], qty_xyz))
-            tasks.append(self._send_order_raw("ABC", 0, prices['ABC']['ask'], qty_abc))
-            tasks.append(self._send_order_raw("DEF", 0, prices['DEF']['ask'], qty_def))
-            
-        elif side == 'BUY_ETF':
-            # Buy ETF (Ask) + Sell Components (Bid)
-            # print(f">>> ARB EXECUTION: Buy {qty_etf} ETF | Sell Components")
-            tasks.append(self._send_order_raw("ETF", 0, prices['ETF']['ask'], qty_etf))
-            tasks.append(self._send_order_raw("XYZ", 1, prices['XYZ']['bid'], qty_xyz))
-            tasks.append(self._send_order_raw("ABC", 1, prices['ABC']['bid'], qty_abc))
-            tasks.append(self._send_order_raw("DEF", 1, prices['DEF']['bid'], qty_def))
+        await self.client.send_new_async(
+            client_id=self.req_id,
+            symbol_id=SYMBOLS[ticker],
+            side=side,
+            price_ticks=ticks,
+            quantity=qty
+        )
 
-        # CRITICAL: Concurrent submission to lock in the spread 
-        await asyncio.gather(*tasks) 
+        mid = price
+        await self.exposure_mgr.register_trade(qty * mid)
 
-    async def run(self):
-        print(f"--- STARTING MAX PROFIT ARBITRAGE (Threshold: ${MIN_PROFIT_THRESHOLD:.2f}, Notional: ${MAX_TRADE_NOTIONAL}) ---")
-        while True:
-            quotes = await self.get_all_prices()
-            if not quotes or not all(k in quotes for k in ['XYZ', 'ABC', 'DEF', 'ETF']):
-                await asyncio.sleep(0.001); continue
+    async def arb(self, quotes):
+        bidETF = quotes["ETF"]["bid"]
+        askETF = quotes["ETF"]["ask"]
 
-            # True Profit Calculation (Uses Bids/Asks)
-            cost_buy_basket = (
-                self.weights['XYZ'] * quotes['XYZ']['ask'] + 
-                self.weights['ABC'] * quotes['ABC']['ask'] + 
-                self.weights['DEF'] * quotes['DEF']['ask']
-            )
-            proceeds_sell_basket = (
-                self.weights['XYZ'] * quotes['XYZ']['bid'] + 
-                self.weights['ABC'] * quotes['ABC']['bid'] + 
-                self.weights['DEF'] * quotes['DEF']['bid']
-            )
+        # Basket values
+        buy_basket = (
+            WEIGHTS["XYZ"] * quotes["XYZ"]["ask"] +
+            WEIGHTS["ABC"] * quotes["ABC"]["ask"] +
+            WEIGHTS["DEF"] * quotes["DEF"]["ask"]
+        )
 
-            bid_etf = quotes['ETF']['bid']
-            ask_etf = quotes['ETF']['ask']
+        sell_basket = (
+            WEIGHTS["XYZ"] * quotes["XYZ"]["bid"] +
+            WEIGHTS["ABC"] * quotes["ABC"]["bid"] +
+            WEIGHTS["DEF"] * quotes["DEF"]["bid"]
+        )
 
-            # Spread A: Sell ETF, Buy Basket (ETF is overpriced)
-            spread_sell_etf = bid_etf - cost_buy_basket
-            
-            # Spread B: Buy ETF, Sell Basket (ETF is underpriced)
-            spread_buy_etf = proceeds_sell_basket - ask_etf
+        spread_sell = bidETF - buy_basket
+        spread_buy = sell_basket - askETF
 
-            # Execution Logic
-            current_etf_price = (bid_etf + ask_etf) / 2
-            target_qty = int(MAX_TRADE_NOTIONAL / current_etf_price)
-            
-            if spread_sell_etf > MIN_PROFIT_THRESHOLD:
-                # print(f"[ARB FOUND] SELL: Spread: {spread_sell_etf:.2f}. Executing {target_qty}...")
-                await self.execute_basket('SELL_ETF', target_qty, quotes)
-                # REMOVED: await asyncio.sleep(0.05) 
-                
-            elif spread_buy_etf > MIN_PROFIT_THRESHOLD:
-                # print(f"[ARB FOUND] BUY: Spread: {spread_buy_etf:.2f}. Executing {target_qty}...")
-                await self.execute_basket('BUY_ETF', target_qty, quotes)
-                # REMOVED: await asyncio.sleep(0.05) 
-            
-            await asyncio.sleep(0.001) # Tightest possible loop for scanning
+        mid = (bidETF + askETF) / 2
+        qty = int(MAX_TRADE_NOTIONAL / mid)
 
-## 🚫 Simple ETF Arbitrage Bot (Discarded/Not Used)
-# The ETFArbitrageBot class is left out as the OptimisedArbBot is superior.
+        if spread_sell > MIN_SPREAD:
+            print(f"[ARB] SELL ETF spread={spread_sell:.3f}")
+            await self.send("ETF", 1, bidETF, qty)
+            await self.send("XYZ", 0, quotes["XYZ"]["ask"], int(qty * 0.5))
+            await self.send("ABC", 0, quotes["ABC"]["ask"], int(qty * 0.3))
+            await self.send("DEF", 0, quotes["DEF"]["ask"], int(qty * 0.2))
 
-# -------------- MAIN PROGRAM ----------------------
+        elif spread_buy > MIN_SPREAD:
+            print(f"[ARB] BUY ETF spread={spread_buy:.3f}")
+            await self.send("ETF", 0, askETF, qty)
+            await self.send("XYZ", 1, quotes["XYZ"]["bid"], int(qty * 0.5))
+            await self.send("ABC", 1, quotes["ABC"]["bid"], int(qty * 0.3))
+            await self.send("DEF", 1, quotes["DEF"]["bid"], int(qty * 0.2))
 
+# ---------------------------------------------------------
+# MAIN ENGINE
+# ---------------------------------------------------------
 async def main():
-    team_token = os.getenv("TEAM_TOKEN")
-    
-    # Check if the exchange host is available in environment variables
-    if not EXCHANGE_HOST:
-        print("ERROR: MARKET_HOST environment variable not set.")
-        return
-
     client = ExchangeClient(
-        team_token=team_token,
+        team_token=TEAM_TOKEN,
         gateway=GatewayConfig(host=EXCHANGE_HOST),
         market_data=MarketDataConfig(host=EXCHANGE_HOST)
     )
+    await client.connect()
+    print("CONNECTED.")
 
-    try:
-        await client.connect()
-        print("Connected successfully!")
+    http_client = httpx.AsyncClient()
 
-        # 💥 STARTING MAX PROFIT BOTS CONCURRENTLY 💥
-        
-        # 1. High-Speed ETF Arbitrage Bot (Trades all 4 symbols)
-        arb_bot = OptimisedArbBot(client)
-        
-        # 2. Mean Reversion Bots (Trades component stocks only)
-        # Note: You can choose to run one or all of these concurrently with the Arb bot.
-        mr_bots = [
-            MeanReversionBot(client, XYZ),
-            MeanReversionBot(client, ABC),
-            MeanReversionBot(client, DEF),
-        ]
+    exposure_mgr = ExposureManager(client)
+    arb = Arbitrage(client, exposure_mgr)
+    mr = MeanReversion()
 
-        # Run all active bots simultaneously
-        tasks = [
-            arb_bot.run(),
-            mr_bots[0].run(),
-            mr_bots[1].run(),
-            mr_bots[2].run(),
-        ]
+    while True:
+        quotes = await get_quotes(http_client)
+        if not quotes:
+            continue
 
-        await asyncio.gather(*tasks)
+        # Update exposure using mid-prices
+        mids = await exposure_mgr.update_exposure(quotes)
 
-    except Exception as e:
-        print(f"An error occurred in main: {e}")
-    finally:
-        await client.close()
-        print("Client closed.")
+        # FORCE minimum exposure
+        await exposure_mgr.force_exposure(mids)
+
+        # Mean reversion signals
+        for sym in ["XYZ", "ABC", "DEF"]:
+            dev = mr.update(sym, mids[sym])
+            if dev is None:
+                continue
+
+            if dev > 0.60:  # SHORT
+                qty = int(50_000 / mids[sym])
+                print(f"[MR] SHORT {sym}")
+                await arb.send(sym, 1, quotes[sym]["bid"], qty)
+
+            elif dev < -0.60:  # LONG
+                qty = int(50_000 / mids[sym])
+                print(f"[MR] LONG {sym}")
+                await arb.send(sym, 0, quotes[sym]["ask"], qty)
+
+        # ETF arbitrage
+        await arb.arb(quotes)
+
+        await asyncio.sleep(LOOP_DELAY)
 
 if __name__ == "__main__":
     asyncio.run(main())

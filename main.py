@@ -221,7 +221,7 @@ class MeanReversionBot:
         self.symbol = symbol_obj
 
         # strategy parameters
-        self.history_len = 20   # number of past prices to keep for average
+        self.history_len = 5   # number of past prices to keep for average
         self.price_history = collections.deque(maxlen=self.history_len)
 
         self.max_pos_dollars = 100000
@@ -338,7 +338,6 @@ class ETFArbitrageBot:
         
         # 1. Sell ETF (Primary Leg) - Use ID self.ids["ETF"]
         tasks.append(sell(self.client, self.ids["ETF"], quotes["ETF"][0], qty, self.req_id)); self.req_id += 1
-
         # 2. Buy Basket (Hedge Legs) - Use IDs
         tasks.append(buy(self.client, self.ids["XYZ"], quotes["XYZ"][1], int(qty*0.5), self.req_id)); self.req_id += 1
         tasks.append(buy(self.client, self.ids["ABC"], quotes["ABC"][1], int(qty*0.3), self.req_id)); self.req_id += 1
@@ -365,7 +364,7 @@ class ETFArbitrageBot:
 
 # --- GLOBAL SETTINGS (Update these values) ---
 EXCHANGE_HOST = "159.65.173.202"
-MAX_TRADE_NOTIONAL = 250000 
+MAX_TRADE_NOTIONAL = 100000 
 MIN_PROFIT_THRESHOLD = 0.08  # <--- CRITICAL FIX: Higher threshold to absorb slippage
 AGGRESSIVE_MARKET_PRICE = 0.05 # Aggression amount if Market Order isn't supported
 
@@ -508,21 +507,24 @@ async def main():
     #bot_abc = MeanReversionBot(client, ABC())
     #bot_def = MeanReversionBot(client, DEF())
 
-    bot = OptimisedArbBot(client)
-    await bot.run()
+    #bot = OptimisedArbBot(client)
+    #await bot.run()
+
+    #order1 = await buy(client, ABC, price_dollars=100, quantity=121, client_id=1)
+    #order1 = await buy(client, DEF, ice_dollars=100, quantity=121, client_id=1)
+    #order1 = await buy(client, XYZ, price_dollars=100, quantity=121, client_id=1)
+    #order1 = await buy(client, ETF, price_dollars=101.53, quantity=1000, client_id=1)
 
     # Run all at the same time
-    #await asyncio.gather(
-        #bot_xyz.run(),
-        #bot_etf.run(),
-        #bot_abc.run(),
-        #bot_def.run()
-    #)
+  
     # Example trades:
-    #order1 = await buy(client, XYZ, price_dollars=0, quantity=200, client_id=1)
+    
     #print("BUY order sent:", order1)
 
-    #order2 = await sell(client, ABC, price_dollars=50.25, quantity=5, client_id=2)
+    #order2 = await sell(client, ABC, price_dollars=50.25, quantity=1000, client_id=2)
+    #order2 = await sell(client, XYZ, price_dollars=50.25, quantity=1000, client_id=2)
+    order2 = await buy(client, DEF, price_dollars=50.25, quantity=512, client_id=2)
+    order1 = await buy(client, ETF, price_dollars=101.53, quantity=8904, client_id=1)
     #print("SELL order sent:", order2)
 
     await client.close()
